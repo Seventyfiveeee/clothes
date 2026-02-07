@@ -7,991 +7,105 @@ using Unity.Collections;
 using Unity.Mathematics;
 using System;
 using System.Collections.Generic;
-using System.IO;
+using System.Linq;
 
 namespace ClothBaking
 {
-    /// <summary>
-    /// High-fidelity cloth offline baker using Projective Dynamics (Local-Global step).
-    /// Implements energy minimization with Newton iterations for Marvelous Designer-quality draping.
-    /// </summary>
-    public class ClothOfflineBaker : EditorWindow
+    // ============================================================================
+    // DATA STRUCTURES
+    // ============================================================================
+
+    [Serializable]
+    public struct DistanceConstraint
     {
-        [MenuItem("Tools/Cloth Offline Baker")]
-        private static void ShowWindow()
-        {
-            var window = GetWindow<ClothOfflineBaker>();
-            window.titleContent = new GUIContent("Cloth Offline Baker");
-            window.Show();
-        }
-
-        #region Serialized Fields (UI State)
-
-        // References
-        private SkinnedMeshRenderer _clothRenderer;
-        private SkinnedMeshRenderer _colliderRenderer;
-        private AnimationClip _animationClip;
-        private Animator _animator;
-
-        // Simulation Parameters
-        private float _timeStep = 1f / 60f;
-        private int _substeps = 4;
-        private int _solverIterations = 20;
-        private float _gravity = -9.81f;
-        private float _totalMass = 1.0f;
-        private float _velocityDamping = 0.999f;
-
-        // Constraint Stiffness
-        private float _stretchStiffness = 1.0f;
-        private float _shearStiffness = 0.8f;
-        private float _bendStiffness = 0.05f;
-
-        // Collision
-        private float _collisionThickness = 0.002f;
-        private float _selfCollisionThickness = 0.004f;
-        private float _friction = 0.3f;
-        private int _hashGridResolution = 64;
-        private float _colliderInflate = 0.001f;
-
-        // Pin Constraints
-        private bool _usePinByColor = false;
-        private int _pinColorChannel = 0; // 0=R, 1=G, 2=B, 3=A
-        private float _pinColorThreshold = 0.5f;
-        private bool _usePinByHeight = false;
-        private float _pinTopPercentage = 10f;
-
-        // Output
-        private string _outputFolder = "Assets/BakedCloth";
-        private string _outputPrefix = "Frame";
-        private bool _singleMeshPerFrame = true;
-
-        private Vector2 _scrollPosition;
-
-        #endregion
-
-        private void OnGUI()
-        {
-            _scrollPosition = EditorGUILayout.BeginScrollView(_scrollPosition);
-
-            EditorGUILayout.LabelField("Cloth Offline Baker", EditorStyles.boldLabel);
-            EditorGUILayout.Space();
-
-            // References Section
-            EditorGUILayout.LabelField("References", EditorStyles.boldLabel);
-            _clothRenderer = EditorGUILayout.ObjectField("Cloth SkinnedMeshRenderer", _clothRenderer, typeof(SkinnedMeshRenderer), true) as SkinnedMeshRenderer;
-            _colliderRenderer = EditorGUILayout.ObjectField("Collider SkinnedMeshRenderer", _colliderRenderer, typeof(SkinnedMeshRenderer), true) as SkinnedMeshRenderer;
-            _animationClip = EditorGUILayout.ObjectField("Animation Clip", _animationClip, typeof(AnimationClip), false) as AnimationClip;
-            _animator = EditorGUILayout.ObjectField("Animator", _animator, typeof(Animator), true) as Animator;
-            EditorGUILayout.Space();
-
-            // Simulation Parameters Section
-            EditorGUILayout.LabelField("Simulation Parameters", EditorStyles.boldLabel);
-            _timeStep = EditorGUILayout.FloatField("Time Step", _timeStep);
-            _substeps = EditorGUILayout.IntSlider("Substeps", _substeps, 1, 20);
-            _solverIterations = EditorGUILayout.IntSlider("Solver Iterations", _solverIterations, 1, 100);
-            _gravity = EditorGUILayout.FloatField("Gravity", _gravity);
-            _totalMass = EditorGUILayout.FloatField("Total Mass (kg)", _totalMass);
-            _velocityDamping = EditorGUILayout.Slider("Velocity Damping", _velocityDamping, 0.9f, 1.0f);
-            EditorGUILayout.Space();
-
-            // Constraint Stiffness Section
-            EditorGUILayout.LabelField("Constraint Stiffness", EditorStyles.boldLabel);
-            _stretchStiffness = EditorGUILayout.Slider("Stretch", _stretchStiffness, 0f, 1f);
-            _shearStiffness = EditorGUILayout.Slider("Shear", _shearStiffness, 0f, 1f);
-            _bendStiffness = EditorGUILayout.Slider("Bend", _bendStiffness, 0f, 1f);
-            EditorGUILayout.Space();
-
-            // Collision Section
-            EditorGUILayout.LabelField("Collision", EditorStyles.boldLabel);
-            _collisionThickness = EditorGUILayout.FloatField("Collision Thickness", _collisionThickness);
-            _selfCollisionThickness = EditorGUILayout.FloatField("Self-Collision Thickness", _selfCollisionThickness);
-            _friction = EditorGUILayout.Slider("Friction", _friction, 0f, 1f);
-            _hashGridResolution = EditorGUILayout.IntSlider("Hash Grid Resolution", _hashGridResolution, 16, 256);
-            _colliderInflate = EditorGUILayout.FloatField("Collider Inflate", _colliderInflate);
-            EditorGUILayout.Space();
-
-            // Pin Constraints Section
-            EditorGUILayout.LabelField("Pin Constraints", EditorStyles.boldLabel);
-            _usePinByColor = EditorGUILayout.Toggle("Use Pin by Color", _usePinByColor);
-            if (_usePinByColor)
-            {
-                string[] channels = { "Red", "Green", "Blue", "Alpha" };
-                _pinColorChannel = EditorGUILayout.Popup("Color Channel", _pinColorChannel, channels);
-                _pinColorThreshold = EditorGUILayout.Slider("Threshold", _pinColorThreshold, 0f, 1f);
-            }
-            _usePinByHeight = EditorGUILayout.Toggle("Use Pin by Height", _usePinByHeight);
-            if (_usePinByHeight)
-            {
-                _pinTopPercentage = EditorGUILayout.Slider("Top Percentage", _pinTopPercentage, 0f, 100f);
-            }
-            EditorGUILayout.Space();
-
-            // Output Section
-            EditorGUILayout.LabelField("Output", EditorStyles.boldLabel);
-            _outputFolder = EditorGUILayout.TextField("Output Folder", _outputFolder);
-            _outputPrefix = EditorGUILayout.TextField("Output Prefix", _outputPrefix);
-            _singleMeshPerFrame = EditorGUILayout.Toggle("Single Mesh Per Frame", _singleMeshPerFrame);
-            EditorGUILayout.Space();
-
-            // Bake Button
-            if (GUILayout.Button("Bake", GUILayout.Height(40)))
-            {
-                StartBaking();
-            }
-
-            EditorGUILayout.EndScrollView();
-        }
-
-        private void StartBaking()
-        {
-            if (!ValidateInputs())
-                return;
-
-            try
-            {
-                BakeClothAnimation();
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"Baking failed: {e.Message}\n{e.StackTrace}");
-                EditorUtility.ClearProgressBar();
-            }
-        }
-
-        private bool ValidateInputs()
-        {
-            if (_clothRenderer == null)
-            {
-                EditorUtility.DisplayDialog("Error", "Cloth SkinnedMeshRenderer is required.", "OK");
-                return false;
-            }
-            if (_colliderRenderer == null)
-            {
-                EditorUtility.DisplayDialog("Error", "Collider SkinnedMeshRenderer is required.", "OK");
-                return false;
-            }
-            if (_animationClip == null)
-            {
-                EditorUtility.DisplayDialog("Error", "Animation Clip is required.", "OK");
-                return false;
-            }
-            if (_animator == null)
-            {
-                EditorUtility.DisplayDialog("Error", "Animator is required.", "OK");
-                return false;
-            }
-            return true;
-        }
-
-        private void BakeClothAnimation()
-        {
-            // Create output directory
-            if (!Directory.Exists(_outputFolder))
-            {
-                Directory.CreateDirectory(_outputFolder);
-            }
-
-            // Get animation info
-            float clipLength = _animationClip.length;
-            float frameRate = 1f / _timeStep;
-            int totalFrames = Mathf.CeilToInt(clipLength * frameRate);
-
-            Debug.Log($"Starting cloth baking: {totalFrames} frames, {_substeps} substeps, {_solverIterations} iterations");
-
-            // Sample cloth mesh at T=0 to get topology
-            _animator.Play(_animationClip.name, 0, 0f);
-            _animator.Update(0f);
-
-            Mesh sourceMesh = new Mesh();
-            _clothRenderer.BakeMesh(sourceMesh);
-
-            // Transform to world space for initial positions
-            Vector3[] sourceVertices = sourceMesh.vertices;
-            Vector3[] worldVertices = new Vector3[sourceVertices.Length];
-            for (int i = 0; i < sourceVertices.Length; i++)
-            {
-                worldVertices[i] = _clothRenderer.transform.TransformPoint(sourceVertices[i]);
-            }
-
-            // Build constraints
-            var constraints = ConstraintBuilder.BuildConstraints(sourceMesh);
-            Debug.Log($"Built constraints: {constraints.edgeConstraints.Length} edges, " +
-                     $"{constraints.shearConstraints.Length} shear, {constraints.bendConstraints.Length} bend");
-
-            // Compute masses
-            float[] masses = ComputeMasses(sourceMesh, worldVertices, constraints);
-
-            // Determine pin constraints
-            float[] pinWeights = ComputePinWeights(sourceMesh, worldVertices);
-            int pinnedCount = 0;
-            for (int i = 0; i < pinWeights.Length; i++)
-            {
-                if (pinWeights[i] > 0f)
-                    pinnedCount++;
-            }
-            Debug.Log($"Pinned {pinnedCount} vertices");
-
-            // Initialize solver
-            ProjectiveDynamicsSolver solver = null;
-            try
-            {
-                solver = new ProjectiveDynamicsSolver(
-                    worldVertices,
-                    masses,
-                    pinWeights,
-                    constraints,
-                    _solverIterations,
-                    _gravity,
-                    _velocityDamping,
-                    _stretchStiffness,
-                    _shearStiffness,
-                    _bendStiffness,
-                    _collisionThickness,
-                    _selfCollisionThickness,
-                    _friction,
-                    _hashGridResolution,
-                    _colliderInflate
-                );
-
-                // Baking loop
-                float subDt = _timeStep / _substeps;
-
-                for (int frame = 0; frame < totalFrames; frame++)
-                {
-                    float time = frame * _timeStep;
-
-                    // Update animation
-                    _animator.Play(_animationClip.name, 0, time / clipLength);
-                    _animator.Update(0f);
-
-                    // Update pin targets
-                    Mesh clothMesh = new Mesh();
-                    _clothRenderer.BakeMesh(clothMesh);
-                    Vector3[] clothVerts = clothMesh.vertices;
-                    for (int i = 0; i < clothVerts.Length; i++)
-                    {
-                        solver.pinTargets[i] = _clothRenderer.transform.TransformPoint(clothVerts[i]);
-                    }
-                    DestroyImmediate(clothMesh);
-
-                    // Bake collider
-                    Mesh colliderMesh = new Mesh();
-                    _colliderRenderer.BakeMesh(colliderMesh);
-                    Vector3[] colliderVerts = colliderMesh.vertices;
-                    int[] colliderTris = colliderMesh.triangles;
-
-                    NativeArray<float3> colliderVertsNative = new NativeArray<float3>(colliderVerts.Length, Allocator.TempJob);
-                    NativeArray<int> colliderTrisNative = new NativeArray<int>(colliderTris.Length, Allocator.TempJob);
-
-                    for (int i = 0; i < colliderVerts.Length; i++)
-                    {
-                        colliderVertsNative[i] = _colliderRenderer.transform.TransformPoint(colliderVerts[i]);
-                    }
-                    for (int i = 0; i < colliderTris.Length; i++)
-                    {
-                        colliderTrisNative[i] = colliderTris[i];
-                    }
-
-                    DestroyImmediate(colliderMesh);
-
-                    // Simulate substeps
-                    for (int substep = 0; substep < _substeps; substep++)
-                    {
-                        solver.Step(subDt, colliderVertsNative, colliderTrisNative);
-                    }
-
-                    colliderVertsNative.Dispose();
-                    colliderTrisNative.Dispose();
-
-                    // Save output mesh
-                    SaveOutputMesh(sourceMesh, solver.positions, frame);
-
-                    // Progress bar
-                    if (frame % 10 == 0 || frame == totalFrames - 1)
-                    {
-                        bool cancel = EditorUtility.DisplayCancelableProgressBar(
-                            "Baking Cloth",
-                            $"Frame {frame + 1}/{totalFrames}",
-                            (float)(frame + 1) / totalFrames
-                        );
-                        if (cancel)
-                        {
-                            Debug.Log("Baking cancelled by user.");
-                            break;
-                        }
-                    }
-                }
-
-                EditorUtility.ClearProgressBar();
-                AssetDatabase.Refresh();
-                Debug.Log($"Baking complete! Output saved to {_outputFolder}");
-            }
-            finally
-            {
-                solver?.Dispose();
-                DestroyImmediate(sourceMesh);
-            }
-        }
-
-        private float[] ComputeMasses(Mesh mesh, Vector3[] worldVertices, ConstraintData constraints)
-        {
-            int vertexCount = worldVertices.Length;
-            float[] masses = new float[vertexCount];
-
-            // Compute area-weighted Voronoi masses
-            int[] triangles = mesh.triangles;
-            for (int i = 0; i < triangles.Length; i += 3)
-            {
-                int i0 = triangles[i];
-                int i1 = triangles[i + 1];
-                int i2 = triangles[i + 2];
-
-                Vector3 v0 = worldVertices[i0];
-                Vector3 v1 = worldVertices[i1];
-                Vector3 v2 = worldVertices[i2];
-
-                float area = Vector3.Cross(v1 - v0, v2 - v0).magnitude * 0.5f;
-                float areaPer3 = area / 3f;
-
-                masses[i0] += areaPer3;
-                masses[i1] += areaPer3;
-                masses[i2] += areaPer3;
-            }
-
-            // Normalize to total mass
-            float totalArea = 0f;
-            for (int i = 0; i < vertexCount; i++)
-            {
-                totalArea += masses[i];
-            }
-
-            float scale = _totalMass / Mathf.Max(totalArea, 1e-9f);
-            float minMass = _totalMass / (vertexCount * 100f);
-
-            for (int i = 0; i < vertexCount; i++)
-            {
-                masses[i] = Mathf.Max(masses[i] * scale, minMass);
-            }
-
-            return masses;
-        }
-
-        private float[] ComputePinWeights(Mesh mesh, Vector3[] worldVertices)
-        {
-            int vertexCount = worldVertices.Length;
-            float[] pinWeights = new float[vertexCount];
-
-            // Pin by color
-            if (_usePinByColor && mesh.colors != null && mesh.colors.Length == vertexCount)
-            {
-                Color[] colors = mesh.colors;
-                for (int i = 0; i < vertexCount; i++)
-                {
-                    float channelValue = 0f;
-                    switch (_pinColorChannel)
-                    {
-                        case 0: channelValue = colors[i].r; break;
-                        case 1: channelValue = colors[i].g; break;
-                        case 2: channelValue = colors[i].b; break;
-                        case 3: channelValue = colors[i].a; break;
-                    }
-
-                    if (channelValue >= _pinColorThreshold)
-                    {
-                        pinWeights[i] = Mathf.Max(pinWeights[i], channelValue);
-                    }
-                }
-            }
-
-            // Pin by height
-            if (_usePinByHeight)
-            {
-                float minY = float.MaxValue;
-                float maxY = float.MinValue;
-                for (int i = 0; i < vertexCount; i++)
-                {
-                    float y = worldVertices[i].y;
-                    minY = Mathf.Min(minY, y);
-                    maxY = Mathf.Max(maxY, y);
-                }
-
-                float threshold = maxY - (maxY - minY) * (_pinTopPercentage / 100f);
-                for (int i = 0; i < vertexCount; i++)
-                {
-                    if (worldVertices[i].y >= threshold)
-                    {
-                        pinWeights[i] = 1f;
-                    }
-                }
-            }
-
-            return pinWeights;
-        }
-
-        private void SaveOutputMesh(Mesh sourceMesh, NativeArray<float3> positions, int frame)
-        {
-            // Convert back to local space
-            Vector3[] localVertices = new Vector3[positions.Length];
-            for (int i = 0; i < positions.Length; i++)
-            {
-                Vector3 worldPos = positions[i];
-                localVertices[i] = _clothRenderer.transform.InverseTransformPoint(worldPos);
-            }
-
-            // Create output mesh
-            Mesh outputMesh = new Mesh();
-            outputMesh.name = $"{_outputPrefix}{frame:D4}";
-            outputMesh.vertices = localVertices;
-            outputMesh.triangles = sourceMesh.triangles;
-            outputMesh.uv = sourceMesh.uv;
-            outputMesh.colors = sourceMesh.colors;
-            outputMesh.boneWeights = sourceMesh.boneWeights;
-            outputMesh.bindposes = sourceMesh.bindposes;
-
-            outputMesh.RecalculateNormals();
-            outputMesh.RecalculateBounds();
-            outputMesh.RecalculateTangents();
-
-            // Save as asset
-            string assetPath = $"{_outputFolder}/{_outputPrefix}{frame:D4}.asset";
-            AssetDatabase.CreateAsset(outputMesh, assetPath);
-        }
-    }
-
-    #region Constraint Data Structures
-
-    public struct EdgeConstraint
-    {
-        public int i0;
-        public int i1;
+        public int particleA;
+        public int particleB;
         public float restLength;
+        public float weight;
     }
 
-    public struct BendConstraint
+    [Serializable]
+    public struct BendingConstraint
     {
-        public int e0;
-        public int e1;
-        public int oppositeA;
-        public int oppositeB;
-        public float restAngle;
+        public int p0, p1, p2, p3; // edge (p0,p1), opposite vertices p2, p3
+        public float Q00, Q01, Q02, Q03;
+        public float Q11, Q12, Q13;
+        public float Q22, Q23;
+        public float Q33;
+        public float weight;
     }
 
-    public struct ConstraintData
+    [Serializable]
+    public struct ParticleConstraintRef
     {
-        public EdgeConstraint[] edgeConstraints;
-        public EdgeConstraint[] shearConstraints;
-        public BendConstraint[] bendConstraints;
+        public int constraintIndex;
+        public int localIndex; // 0 or 1 (which end of the constraint)
     }
 
-    #endregion
-
-    #region Constraint Builder
-
-    public static class ConstraintBuilder
+    [Serializable]
+    public struct ParticleBendRef
     {
-        public static ConstraintData BuildConstraints(Mesh mesh)
-        {
-            Vector3[] vertices = mesh.vertices;
-            int[] triangles = mesh.triangles;
-
-            // Build edge constraints
-            Dictionary<long, EdgeConstraint> edgeDict = new Dictionary<long, EdgeConstraint>();
-            for (int i = 0; i < triangles.Length; i += 3)
-            {
-                int i0 = triangles[i];
-                int i1 = triangles[i + 1];
-                int i2 = triangles[i + 2];
-
-                AddEdge(edgeDict, vertices, i0, i1);
-                AddEdge(edgeDict, vertices, i1, i2);
-                AddEdge(edgeDict, vertices, i2, i0);
-            }
-
-            EdgeConstraint[] edges = new EdgeConstraint[edgeDict.Count];
-            edgeDict.Values.CopyTo(edges, 0);
-
-            // Build triangle adjacency for bending
-            Dictionary<long, List<int>> edgeToTriangles = new Dictionary<long, List<int>>();
-            for (int triIdx = 0; triIdx < triangles.Length / 3; triIdx++)
-            {
-                int baseIdx = triIdx * 3;
-                int i0 = triangles[baseIdx];
-                int i1 = triangles[baseIdx + 1];
-                int i2 = triangles[baseIdx + 2];
-
-                AddTriangleToEdge(edgeToTriangles, i0, i1, triIdx);
-                AddTriangleToEdge(edgeToTriangles, i1, i2, triIdx);
-                AddTriangleToEdge(edgeToTriangles, i2, i0, triIdx);
-            }
-
-            // Build bend and shear constraints
-            List<BendConstraint> bendList = new List<BendConstraint>();
-            HashSet<long> shearSet = new HashSet<long>();
-            List<EdgeConstraint> shearList = new List<EdgeConstraint>();
-
-            foreach (var kvp in edgeToTriangles)
-            {
-                if (kvp.Value.Count == 2)
-                {
-                    long edgeKey = kvp.Key;
-                    int minIdx = (int)(edgeKey >> 32);
-                    int maxIdx = (int)(edgeKey & 0xFFFFFFFF);
-
-                    int tri0 = kvp.Value[0];
-                    int tri1 = kvp.Value[1];
-
-                    // Find opposite vertices
-                    int oppositeA = FindOppositeVertex(triangles, tri0, minIdx, maxIdx);
-                    int oppositeB = FindOppositeVertex(triangles, tri1, minIdx, maxIdx);
-
-                    if (oppositeA >= 0 && oppositeB >= 0)
-                    {
-                        // Compute rest angle
-                        Vector3 v0 = vertices[minIdx];
-                        Vector3 v1 = vertices[maxIdx];
-                        Vector3 vA = vertices[oppositeA];
-                        Vector3 vB = vertices[oppositeB];
-
-                        Vector3 n0 = Vector3.Cross(vA - v0, v1 - v0).normalized;
-                        Vector3 n1 = Vector3.Cross(v1 - v0, vB - v0).normalized;
-
-                        float cosAngle = Vector3.Dot(n0, n1);
-                        Vector3 cross = Vector3.Cross(n0, n1);
-                        float sinAngle = cross.magnitude * Mathf.Sign(Vector3.Dot(cross, v1 - v0));
-                        float restAngle = Mathf.Atan2(sinAngle, cosAngle);
-
-                        BendConstraint bend = new BendConstraint
-                        {
-                            e0 = minIdx,
-                            e1 = maxIdx,
-                            oppositeA = oppositeA,
-                            oppositeB = oppositeB,
-                            restAngle = restAngle
-                        };
-                        bendList.Add(bend);
-
-                        // Add shear constraint (diagonal)
-                        long shearKey = GetEdgeKey(oppositeA, oppositeB);
-                        if (!edgeDict.ContainsKey(shearKey) && !shearSet.Contains(shearKey))
-                        {
-                            shearSet.Add(shearKey);
-                            float shearLength = (vertices[oppositeA] - vertices[oppositeB]).magnitude;
-                            EdgeConstraint shear = new EdgeConstraint
-                            {
-                                i0 = oppositeA,
-                                i1 = oppositeB,
-                                restLength = shearLength
-                            };
-                            shearList.Add(shear);
-                        }
-                    }
-                }
-            }
-
-            return new ConstraintData
-            {
-                edgeConstraints = edges,
-                shearConstraints = shearList.ToArray(),
-                bendConstraints = bendList.ToArray()
-            };
-        }
-
-        private static void AddEdge(Dictionary<long, EdgeConstraint> dict, Vector3[] vertices, int i0, int i1)
-        {
-            long key = GetEdgeKey(i0, i1);
-            if (!dict.ContainsKey(key))
-            {
-                float length = (vertices[i0] - vertices[i1]).magnitude;
-                dict[key] = new EdgeConstraint
-                {
-                    i0 = Mathf.Min(i0, i1),
-                    i1 = Mathf.Max(i0, i1),
-                    restLength = length
-                };
-            }
-        }
-
-        private static void AddTriangleToEdge(Dictionary<long, List<int>> dict, int i0, int i1, int triIdx)
-        {
-            long key = GetEdgeKey(i0, i1);
-            if (!dict.ContainsKey(key))
-            {
-                dict[key] = new List<int>();
-            }
-            dict[key].Add(triIdx);
-        }
-
-        private static long GetEdgeKey(int i0, int i1)
-        {
-            int min = Mathf.Min(i0, i1);
-            int max = Mathf.Max(i0, i1);
-            return ((long)min << 32) | (uint)max;
-        }
-
-        private static int FindOppositeVertex(int[] triangles, int triIdx, int e0, int e1)
-        {
-            int baseIdx = triIdx * 3;
-            int v0 = triangles[baseIdx];
-            int v1 = triangles[baseIdx + 1];
-            int v2 = triangles[baseIdx + 2];
-
-            if (v0 != e0 && v0 != e1) return v0;
-            if (v1 != e0 && v1 != e1) return v1;
-            if (v2 != e0 && v2 != e1) return v2;
-            return -1;
-        }
+        public int bendIndex;
+        public int localIndex; // 0,1,2,3
     }
 
-    #endregion
-
-    #region Projective Dynamics Solver
-
-    public class ProjectiveDynamicsSolver : IDisposable
+    [Serializable]
+    public struct SphereColliderData
     {
-        // Particle state
-        public NativeArray<float3> positions;
-        public NativeArray<float3> velocities;
-        public NativeArray<float3> predictedPositions;
-        public NativeArray<float> inverseMasses;
-        public NativeArray<float> pinWeights;
-        public NativeArray<float3> pinTargets;
-
-        // Constraints
-        private NativeArray<EdgeConstraint> _edgeConstraints;
-        private NativeArray<EdgeConstraint> _shearConstraints;
-        private NativeArray<BendConstraint> _bendConstraints;
-
-        // Solver state
-        private NativeArray<float> _diagA;
-        private NativeArray<float3> _rhs;
-        private NativeArray<float3> _q;
-
-        // Spatial hash for self-collision
-        private NativeMultiHashMap<int, int> _spatialHash;
-
-        // Parameters
-        private int _solverIterations;
-        private float _gravity;
-        private float _velocityDamping;
-        private float _stretchStiffness;
-        private float _shearStiffness;
-        private float _bendStiffness;
-        private float _collisionThickness;
-        private float _selfCollisionThickness;
-        private float _friction;
-        private int _hashGridResolution;
-        private float _colliderInflate;
-
-        public ProjectiveDynamicsSolver(
-            Vector3[] initialPositions,
-            float[] masses,
-            float[] pinWeights,
-            ConstraintData constraints,
-            int solverIterations,
-            float gravity,
-            float velocityDamping,
-            float stretchStiffness,
-            float shearStiffness,
-            float bendStiffness,
-            float collisionThickness,
-            float selfCollisionThickness,
-            float friction,
-            int hashGridResolution,
-            float colliderInflate)
-        {
-            int vertexCount = initialPositions.Length;
-
-            // Allocate particle arrays
-            positions = new NativeArray<float3>(vertexCount, Allocator.Persistent);
-            velocities = new NativeArray<float3>(vertexCount, Allocator.Persistent);
-            predictedPositions = new NativeArray<float3>(vertexCount, Allocator.Persistent);
-            inverseMasses = new NativeArray<float>(vertexCount, Allocator.Persistent);
-            this.pinWeights = new NativeArray<float>(vertexCount, Allocator.Persistent);
-            pinTargets = new NativeArray<float3>(vertexCount, Allocator.Persistent);
-
-            // Initialize positions and masses
-            for (int i = 0; i < vertexCount; i++)
-            {
-                positions[i] = initialPositions[i];
-                velocities[i] = float3.zero;
-                inverseMasses[i] = pinWeights[i] > 0f ? 0f : 1f / masses[i];
-                this.pinWeights[i] = pinWeights[i];
-                pinTargets[i] = initialPositions[i];
-            }
-
-            // Allocate constraint arrays
-            _edgeConstraints = new NativeArray<EdgeConstraint>(constraints.edgeConstraints.Length, Allocator.Persistent);
-            _shearConstraints = new NativeArray<EdgeConstraint>(constraints.shearConstraints.Length, Allocator.Persistent);
-            _bendConstraints = new NativeArray<BendConstraint>(constraints.bendConstraints.Length, Allocator.Persistent);
-
-            for (int i = 0; i < constraints.edgeConstraints.Length; i++)
-                _edgeConstraints[i] = constraints.edgeConstraints[i];
-            for (int i = 0; i < constraints.shearConstraints.Length; i++)
-                _shearConstraints[i] = constraints.shearConstraints[i];
-            for (int i = 0; i < constraints.bendConstraints.Length; i++)
-                _bendConstraints[i] = constraints.bendConstraints[i];
-
-            // Allocate solver arrays
-            _diagA = new NativeArray<float>(vertexCount, Allocator.Persistent);
-            _rhs = new NativeArray<float3>(vertexCount, Allocator.Persistent);
-            _q = new NativeArray<float3>(vertexCount, Allocator.Persistent);
-
-            // Allocate spatial hash
-            _spatialHash = new NativeMultiHashMap<int, int>(vertexCount * 27, Allocator.Persistent);
-
-            // Store parameters
-            _solverIterations = solverIterations;
-            _gravity = gravity;
-            _velocityDamping = velocityDamping;
-            _stretchStiffness = stretchStiffness;
-            _shearStiffness = shearStiffness;
-            _bendStiffness = bendStiffness;
-            _collisionThickness = collisionThickness;
-            _selfCollisionThickness = selfCollisionThickness;
-            _friction = friction;
-            _hashGridResolution = hashGridResolution;
-            _colliderInflate = colliderInflate;
-        }
-
-        public void Step(float dt, NativeArray<float3> colliderVertices, NativeArray<int> colliderTriangles)
-        {
-            int vertexCount = positions.Length;
-
-            // Predict positions
-            var predictJob = new PredictPositionsJob
-            {
-                positions = positions,
-                velocities = velocities,
-                predictedPositions = predictedPositions,
-                inverseMasses = inverseMasses,
-                gravity = _gravity,
-                damping = _velocityDamping,
-                dt = dt
-            };
-            predictJob.Schedule(vertexCount, 64).Complete();
-
-            // Build diagonal matrix (mass term + constraint weights)
-            var clearDiagJob = new ClearFloatArrayJob { array = _diagA };
-            clearDiagJob.Schedule(vertexCount, 64).Complete();
-
-            var buildDiagMassJob = new BuildDiagMassJob
-            {
-                diagA = _diagA,
-                inverseMasses = inverseMasses,
-                dt = dt
-            };
-            buildDiagMassJob.Schedule(vertexCount, 64).Complete();
-
-            var buildDiagEdgeJob = new BuildDiagEdgeConstraintJob
-            {
-                diagA = _diagA,
-                constraints = _edgeConstraints,
-                stiffness = _stretchStiffness
-            };
-            buildDiagEdgeJob.Schedule(_edgeConstraints.Length, 64).Complete();
-
-            var buildDiagShearJob = new BuildDiagShearConstraintJob
-            {
-                diagA = _diagA,
-                constraints = _shearConstraints,
-                stiffness = _shearStiffness
-            };
-            buildDiagShearJob.Schedule(_shearConstraints.Length, 64).Complete();
-
-            var buildDiagBendJob = new BuildDiagBendConstraintJob
-            {
-                diagA = _diagA,
-                constraints = _bendConstraints,
-                stiffness = _bendStiffness
-            };
-            buildDiagBendJob.Schedule(_bendConstraints.Length, 64).Complete();
-
-            var clampDiagJob = new ClampDiagJob { diagA = _diagA, minValue = 1e-9f };
-            clampDiagJob.Schedule(vertexCount, 64).Complete();
-
-            // Local-Global iterations
-            for (int iter = 0; iter < _solverIterations; iter++)
-            {
-                // Clear RHS
-                var clearRhsJob = new ClearFloat3ArrayJob { array = _rhs };
-                clearRhsJob.Schedule(vertexCount, 64).Complete();
-
-                // Build RHS momentum term
-                var buildRhsMomentumJob = new BuildRhsMomentumJob
-                {
-                    rhs = _rhs,
-                    predictedPositions = predictedPositions,
-                    inverseMasses = inverseMasses,
-                    dt = dt
-                };
-                buildRhsMomentumJob.Schedule(vertexCount, 64).Complete();
-
-                // Local step - edge constraints
-                float3[] qArray = new float3[vertexCount];
-                if (iter == 0)
-                {
-                    for (int i = 0; i < vertexCount; i++)
-                        qArray[i] = predictedPositions[i];
-                }
-                else
-                {
-                    for (int i = 0; i < vertexCount; i++)
-                        qArray[i] = _q[i];
-                }
-
-                NativeArray<float3> qInput = new NativeArray<float3>(qArray, Allocator.TempJob);
-
-                var localStepEdgeJob = new LocalStepEdgeJob
-                {
-                    rhs = _rhs,
-                    positions = qInput,
-                    constraints = _edgeConstraints,
-                    stiffness = _stretchStiffness
-                };
-                localStepEdgeJob.Schedule(_edgeConstraints.Length, 64).Complete();
-
-                // Local step - shear constraints
-                var localStepShearJob = new LocalStepShearJob
-                {
-                    rhs = _rhs,
-                    positions = qInput,
-                    constraints = _shearConstraints,
-                    stiffness = _shearStiffness
-                };
-                localStepShearJob.Schedule(_shearConstraints.Length, 64).Complete();
-
-                // Local step - bend constraints
-                var localStepBendJob = new LocalStepBendJob
-                {
-                    rhs = _rhs,
-                    positions = qInput,
-                    constraints = _bendConstraints,
-                    stiffness = _bendStiffness
-                };
-                localStepBendJob.Schedule(_bendConstraints.Length, 64).Complete();
-
-                qInput.Dispose();
-
-                // Global step
-                var globalStepJob = new GlobalStepJob
-                {
-                    q = _q,
-                    rhs = _rhs,
-                    diagA = _diagA,
-                    pinWeights = pinWeights,
-                    pinTargets = pinTargets
-                };
-                globalStepJob.Schedule(vertexCount, 64).Complete();
-            }
-
-            // Apply collisions
-            var colliderCollisionJob = new ColliderCollisionJob
-            {
-                positions = _q,
-                velocities = velocities,
-                inverseMasses = inverseMasses,
-                colliderVertices = colliderVertices,
-                colliderTriangles = colliderTriangles,
-                thickness = _collisionThickness + _colliderInflate,
-                friction = _friction,
-                dt = dt
-            };
-            colliderCollisionJob.Schedule(vertexCount, 16).Complete();
-
-            // Self-collision
-            _spatialHash.Clear();
-            var buildHashJob = new BuildSpatialHashJob
-            {
-                positions = _q,
-                spatialHash = _spatialHash.AsParallelWriter(),
-                cellSize = _selfCollisionThickness * 2f
-            };
-            buildHashJob.Schedule(vertexCount, 64).Complete();
-
-            var selfCollisionJob = new SelfCollisionJob
-            {
-                positions = _q,
-                velocities = velocities,
-                inverseMasses = inverseMasses,
-                spatialHash = _spatialHash,
-                thickness = _selfCollisionThickness,
-                friction = _friction,
-                cellSize = _selfCollisionThickness * 2f
-            };
-            selfCollisionJob.Schedule(vertexCount, 16).Complete();
-
-            // Update velocity and position
-            var updateJob = new UpdateVelocityPositionJob
-            {
-                positions = positions,
-                velocities = velocities,
-                q = _q,
-                dt = dt
-            };
-            updateJob.Schedule(vertexCount, 64).Complete();
-        }
-
-        public void Dispose()
-        {
-            if (positions.IsCreated) positions.Dispose();
-            if (velocities.IsCreated) velocities.Dispose();
-            if (predictedPositions.IsCreated) predictedPositions.Dispose();
-            if (inverseMasses.IsCreated) inverseMasses.Dispose();
-            if (pinWeights.IsCreated) pinWeights.Dispose();
-            if (pinTargets.IsCreated) pinTargets.Dispose();
-            if (_edgeConstraints.IsCreated) _edgeConstraints.Dispose();
-            if (_shearConstraints.IsCreated) _shearConstraints.Dispose();
-            if (_bendConstraints.IsCreated) _bendConstraints.Dispose();
-            if (_diagA.IsCreated) _diagA.Dispose();
-            if (_rhs.IsCreated) _rhs.Dispose();
-            if (_q.IsCreated) _q.Dispose();
-            if (_spatialHash.IsCreated) _spatialHash.Dispose();
-        }
+        public float3 center;
+        public float radius;
     }
 
-    #endregion
+    [Serializable]
+    public struct CapsuleColliderData
+    {
+        public float3 point0;
+        public float3 point1;
+        public float radius;
+    }
 
-    #region Burst Jobs
+    // ============================================================================
+    // BURST JOBS
+    // ============================================================================
 
     [BurstCompile]
-    struct PredictPositionsJob : IJobParallelFor
+    public struct MomentumStepJob : IJobParallelFor
     {
         [ReadOnly] public NativeArray<float3> positions;
         [ReadOnly] public NativeArray<float3> velocities;
-        [ReadOnly] public NativeArray<float> inverseMasses;
-        [WriteOnly] public NativeArray<float3> predictedPositions;
-        public float gravity;
-        public float damping;
+        [ReadOnly] public NativeArray<float> invMasses;
         public float dt;
+        public float3 gravity;
+        [WriteOnly] public NativeArray<float3> momentum;
 
         public void Execute(int i)
         {
-            if (inverseMasses[i] > 0f)
+            if (invMasses[i] == 0f)
             {
-                float3 vel = velocities[i] * damping;
-                float3 force = new float3(0, gravity, 0) / inverseMasses[i];
-                predictedPositions[i] = positions[i] + vel * dt + force * (dt * dt);
+                momentum[i] = positions[i];
             }
             else
             {
-                predictedPositions[i] = positions[i];
+                float3 acc = gravity;
+                momentum[i] = positions[i] + velocities[i] * dt + acc * (dt * dt);
             }
         }
     }
 
     [BurstCompile]
-    struct ClearFloatArrayJob : IJobParallelFor
+    public struct CopyFloat3Job : IJobParallelFor
     {
-        [WriteOnly] public NativeArray<float> array;
+        [ReadOnly] public NativeArray<float3> source;
+        [WriteOnly] public NativeArray<float3> dest;
 
         public void Execute(int i)
         {
-            array[i] = 0f;
+            dest[i] = source[i];
         }
     }
 
     [BurstCompile]
-    struct ClearFloat3ArrayJob : IJobParallelFor
+    public struct ZeroFloat3Job : IJobParallelFor
     {
         [WriteOnly] public NativeArray<float3> array;
 
@@ -1002,479 +116,1127 @@ namespace ClothBaking
     }
 
     [BurstCompile]
-    struct BuildDiagMassJob : IJobParallelFor
+    public struct ZeroFloatJob : IJobParallelFor
     {
-        [NativeDisableParallelForRestriction] public NativeArray<float> diagA;
-        [ReadOnly] public NativeArray<float> inverseMasses;
+        [WriteOnly] public NativeArray<float> array;
+
+        public void Execute(int i)
+        {
+            array[i] = 0f;
+        }
+    }
+
+    [BurstCompile]
+    public struct LocalStepDistanceJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<float3> positions;
+        [ReadOnly] public NativeArray<float> invMasses;
+        [ReadOnly] public NativeArray<DistanceConstraint> constraints;
+        [WriteOnly] public NativeArray<float3> projections;
+
+        public void Execute(int i)
+        {
+            var c = constraints[i];
+            float3 pA = positions[c.particleA];
+            float3 pB = positions[c.particleB];
+            float3 diff = pB - pA;
+            float dist = math.length(diff);
+
+            if (dist < 1e-7f)
+            {
+                projections[i * 2] = pA;
+                projections[i * 2 + 1] = pB;
+                return;
+            }
+
+            float3 dir = diff / dist;
+            float wA = invMasses[c.particleA];
+            float wB = invMasses[c.particleB];
+            float wSum = wA + wB;
+
+            if (wSum < 1e-9f)
+            {
+                projections[i * 2] = pA;
+                projections[i * 2 + 1] = pB;
+                return;
+            }
+
+            float lambda = (dist - c.restLength) / wSum;
+            projections[i * 2] = pA + dir * (lambda * wA);
+            projections[i * 2 + 1] = pB - dir * (lambda * wB);
+        }
+    }
+
+    [BurstCompile]
+    public struct GlobalStepGatherAndSolveJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<float3> momentum;
+        [ReadOnly] public NativeArray<float> invMasses;
+        [ReadOnly] public NativeArray<float> masses;
         public float dt;
 
-        public void Execute(int i)
-        {
-            if (inverseMasses[i] > 0f)
-            {
-                diagA[i] += 1f / (inverseMasses[i] * dt * dt);
-            }
-            else
-            {
-                diagA[i] += 1e9f; // Very large value for pinned particles
-            }
-        }
-    }
+        // Distance constraints
+        [ReadOnly] public NativeArray<float3> distanceProjections;
+        [ReadOnly] public NativeArray<DistanceConstraint> distanceConstraints;
+        [ReadOnly] public NativeArray<int> distanceOffsets;
+        [ReadOnly] public NativeArray<ParticleConstraintRef> distanceRefs;
 
-    [BurstCompile]
-    struct BuildDiagEdgeConstraintJob : IJobParallelFor
-    {
-        [NativeDisableParallelForRestriction] public NativeArray<float> diagA;
-        [ReadOnly] public NativeArray<EdgeConstraint> constraints;
-        public float stiffness;
+        // Bending constraints (Jacobi splitting)
+        [ReadOnly] public NativeArray<BendingConstraint> bendConstraints;
+        [ReadOnly] public NativeArray<int> bendOffsets;
+        [ReadOnly] public NativeArray<ParticleBendRef> bendRefs;
+        [ReadOnly] public NativeArray<float3> currentPositions;
 
-        public void Execute(int idx)
-        {
-            EdgeConstraint c = constraints[idx];
-            float w = stiffness / math.max(c.restLength, 1e-6f);
-            diagA[c.i0] += w;
-            diagA[c.i1] += w;
-        }
-    }
-
-    [BurstCompile]
-    struct BuildDiagShearConstraintJob : IJobParallelFor
-    {
-        [NativeDisableParallelForRestriction] public NativeArray<float> diagA;
-        [ReadOnly] public NativeArray<EdgeConstraint> constraints;
-        public float stiffness;
-
-        public void Execute(int idx)
-        {
-            EdgeConstraint c = constraints[idx];
-            float w = stiffness / math.max(c.restLength, 1e-6f);
-            diagA[c.i0] += w;
-            diagA[c.i1] += w;
-        }
-    }
-
-    [BurstCompile]
-    struct BuildDiagBendConstraintJob : IJobParallelFor
-    {
-        [NativeDisableParallelForRestriction] public NativeArray<float> diagA;
-        [ReadOnly] public NativeArray<BendConstraint> constraints;
-        public float stiffness;
-
-        public void Execute(int idx)
-        {
-            diagA[constraints[idx].e0] += stiffness;
-            diagA[constraints[idx].e1] += stiffness;
-            diagA[constraints[idx].oppositeA] += stiffness;
-            diagA[constraints[idx].oppositeB] += stiffness;
-        }
-    }
-
-    [BurstCompile]
-    struct ClampDiagJob : IJobParallelFor
-    {
-        public NativeArray<float> diagA;
-        public float minValue;
+        [NativeDisableParallelForRestriction]
+        public NativeArray<float3> newPositions;
 
         public void Execute(int i)
         {
-            diagA[i] = math.max(diagA[i], minValue);
-        }
-    }
-
-    [BurstCompile]
-    struct BuildRhsMomentumJob : IJobParallelFor
-    {
-        [NativeDisableParallelForRestriction] public NativeArray<float3> rhs;
-        [ReadOnly] public NativeArray<float3> predictedPositions;
-        [ReadOnly] public NativeArray<float> inverseMasses;
-        public float dt;
-
-        public void Execute(int i)
-        {
-            if (inverseMasses[i] > 0f)
+            if (invMasses[i] == 0f)
             {
-                float massOverDtSq = 1f / (inverseMasses[i] * dt * dt);
-                rhs[i] += massOverDtSq * predictedPositions[i];
-            }
-        }
-    }
-
-    [BurstCompile]
-    struct LocalStepEdgeJob : IJobParallelFor
-    {
-        [NativeDisableParallelForRestriction] public NativeArray<float3> rhs;
-        [ReadOnly] public NativeArray<float3> positions;
-        [ReadOnly] public NativeArray<EdgeConstraint> constraints;
-        public float stiffness;
-
-        public void Execute(int idx)
-        {
-            EdgeConstraint c = constraints[idx];
-            float3 p0 = positions[c.i0];
-            float3 p1 = positions[c.i1];
-            float3 dir = p0 - p1;
-            float len = math.length(dir);
-            
-            if (len > 1e-9f)
-            {
-                dir /= len;
-            }
-            else
-            {
-                dir = new float3(1, 0, 0);
+                newPositions[i] = momentum[i];
+                return;
             }
 
-            float3 d = c.restLength * dir;
-            float w = stiffness / math.max(c.restLength, 1e-6f);
+            float massWeight = masses[i] / (dt * dt);
+            float3 numerator = massWeight * momentum[i];
+            float denominator = massWeight;
 
-            rhs[c.i0] += w * d;
-            rhs[c.i1] += w * (-d);
-        }
-    }
-
-    [BurstCompile]
-    struct LocalStepShearJob : IJobParallelFor
-    {
-        [NativeDisableParallelForRestriction] public NativeArray<float3> rhs;
-        [ReadOnly] public NativeArray<float3> positions;
-        [ReadOnly] public NativeArray<EdgeConstraint> constraints;
-        public float stiffness;
-
-        public void Execute(int idx)
-        {
-            EdgeConstraint c = constraints[idx];
-            float3 p0 = positions[c.i0];
-            float3 p1 = positions[c.i1];
-            float3 dir = p0 - p1;
-            float len = math.length(dir);
-            
-            if (len > 1e-9f)
+            // Distance constraints
+            int distStart = distanceOffsets[i];
+            int distEnd = distanceOffsets[i + 1];
+            for (int j = distStart; j < distEnd; j++)
             {
-                dir /= len;
-            }
-            else
-            {
-                dir = new float3(1, 0, 0);
+                var cref = distanceRefs[j];
+                var constraint = distanceConstraints[cref.constraintIndex];
+                float3 proj = distanceProjections[cref.constraintIndex * 2 + cref.localIndex];
+                numerator += constraint.weight * proj;
+                denominator += constraint.weight;
             }
 
-            float3 d = c.restLength * dir;
-            float w = stiffness / math.max(c.restLength, 1e-6f);
-
-            rhs[c.i0] += w * d;
-            rhs[c.i1] += w * (-d);
-        }
-    }
-
-    [BurstCompile]
-    struct LocalStepBendJob : IJobParallelFor
-    {
-        [NativeDisableParallelForRestriction] public NativeArray<float3> rhs;
-        [ReadOnly] public NativeArray<float3> positions;
-        [ReadOnly] public NativeArray<BendConstraint> constraints;
-        public float stiffness;
-
-        public void Execute(int idx)
-        {
-            BendConstraint c = constraints[idx];
-            
-            float3 p0 = positions[c.e0];
-            float3 p1 = positions[c.e1];
-            float3 p2 = positions[c.oppositeA];
-            float3 p3 = positions[c.oppositeB];
-
-            float3 e = p1 - p0;
-            float elen = math.length(e);
-            if (elen < 1e-9f) return;
-
-            // Compute face normals
-            float3 n1 = math.cross(p2 - p0, p1 - p0);
-            float3 n2 = math.cross(p1 - p0, p3 - p0);
-            
-            float n1len = math.length(n1);
-            float n2len = math.length(n2);
-            if (n1len < 1e-9f || n2len < 1e-9f) return;
-
-            n1 /= n1len;
-            n2 /= n2len;
-
-            // Current dihedral angle
-            float cosAngle = math.dot(n1, n2);
-            cosAngle = math.clamp(cosAngle, -1f, 1f);
-            float3 cross = math.cross(n1, n2);
-            float sinAngle = math.length(cross) * math.sign(math.dot(cross, e));
-            float currentAngle = math.atan2(sinAngle, cosAngle);
-
-            float angleDiff = currentAngle - c.restAngle;
-
-            // Compute gradients (simplified cotangent weights)
-            float cot1 = math.dot(e, p2 - p0) / math.max(n1len, 1e-9f);
-            float cot2 = math.dot(e, p3 - p0) / math.max(n2len, 1e-9f);
-
-            float3 grad0 = -cot1 * n1 / elen - cot2 * n2 / elen;
-            float3 grad1 = cot1 * n1 / elen + cot2 * n2 / elen;
-            float3 grad2 = n1 / n1len;
-            float3 grad3 = -n2 / n2len;
-
-            float gradLenSq = math.dot(grad0, grad0) + math.dot(grad1, grad1) + 
-                             math.dot(grad2, grad2) + math.dot(grad3, grad3);
-
-            if (gradLenSq < 1e-9f) return;
-
-            float lambda = -angleDiff / gradLenSq;
-            float w = stiffness;
-
-            rhs[c.e0] += w * lambda * grad0;
-            rhs[c.e1] += w * lambda * grad1;
-            rhs[c.oppositeA] += w * lambda * grad2;
-            rhs[c.oppositeB] += w * lambda * grad3;
-        }
-    }
-
-    [BurstCompile]
-    struct GlobalStepJob : IJobParallelFor
-    {
-        [WriteOnly] public NativeArray<float3> q;
-        [ReadOnly] public NativeArray<float3> rhs;
-        [ReadOnly] public NativeArray<float> diagA;
-        [ReadOnly] public NativeArray<float> pinWeights;
-        [ReadOnly] public NativeArray<float3> pinTargets;
-
-        public void Execute(int i)
-        {
-            if (pinWeights[i] > 0f)
+            // Bending constraints (Jacobi splitting)
+            int bendStart = bendOffsets[i];
+            int bendEnd = bendOffsets[i + 1];
+            for (int j = bendStart; j < bendEnd; j++)
             {
-                q[i] = pinTargets[i];
-            }
-            else
-            {
-                q[i] = rhs[i] / diagA[i];
-            }
-        }
-    }
+                var bref = bendRefs[j];
+                var bend = bendConstraints[bref.bendIndex];
+                int localIdx = bref.localIndex;
 
-    [BurstCompile]
-    struct ColliderCollisionJob : IJobParallelFor
-    {
-        [NativeDisableParallelForRestriction] public NativeArray<float3> positions;
-        [NativeDisableParallelForRestriction] public NativeArray<float3> velocities;
-        [ReadOnly] public NativeArray<float> inverseMasses;
-        [ReadOnly] public NativeArray<float3> colliderVertices;
-        [ReadOnly] public NativeArray<int> colliderTriangles;
-        public float thickness;
-        public float friction;
-        public float dt;
+                float Qii = 0f;
+                if (localIdx == 0) Qii = bend.Q00;
+                else if (localIdx == 1) Qii = bend.Q11;
+                else if (localIdx == 2) Qii = bend.Q22;
+                else if (localIdx == 3) Qii = bend.Q33;
 
-        public void Execute(int i)
-        {
-            if (inverseMasses[i] == 0f) return;
-
-            float3 p = positions[i];
-            float minDist = float.MaxValue;
-            float3 closestPoint = p;
-            float3 closestNormal = new float3(0, 1, 0);
-
-            // Check all triangles
-            for (int t = 0; t < colliderTriangles.Length; t += 3)
-            {
-                int i0 = colliderTriangles[t];
-                int i1 = colliderTriangles[t + 1];
-                int i2 = colliderTriangles[t + 2];
-
-                float3 v0 = colliderVertices[i0];
-                float3 v1 = colliderVertices[i1];
-                float3 v2 = colliderVertices[i2];
-
-                // Closest point on triangle
-                float3 closest = ClosestPointOnTriangle(p, v0, v1, v2);
-                float dist = math.length(p - closest);
-
-                if (dist < minDist)
+                // Off-diagonal contribution to RHS
+                float3 offDiag = float3.zero;
+                int[] indices = { bend.p0, bend.p1, bend.p2, bend.p3 };
+                for (int k = 0; k < 4; k++)
                 {
-                    minDist = dist;
-                    closestPoint = closest;
-                    float3 n = math.cross(v1 - v0, v2 - v0);
-                    float nlen = math.length(n);
-                    closestNormal = nlen > 1e-9f ? n / nlen : new float3(0, 1, 0);
+                    if (k == localIdx) continue;
+                    float Qik = GetQElement(bend, localIdx, k);
+                    offDiag += Qik * currentPositions[indices[k]];
                 }
+
+                numerator -= bend.weight * offDiag;
+                denominator += bend.weight * Qii;
             }
 
-            // Apply collision response
-            if (minDist < thickness)
+            if (denominator < 1e-9f)
             {
-                float3 delta = p - closestPoint;
-                float signedDist = math.dot(delta, closestNormal);
-
-                if (signedDist < thickness)
-                {
-                    // Push out
-                    positions[i] = closestPoint + closestNormal * thickness;
-
-                    // Apply friction
-                    float3 vel = velocities[i];
-                    float3 velNormal = closestNormal * math.dot(vel, closestNormal);
-                    float3 velTangent = vel - velNormal;
-                    velocities[i] = velNormal + velTangent * (1f - friction);
-                }
+                newPositions[i] = momentum[i];
+            }
+            else
+            {
+                newPositions[i] = numerator / denominator;
             }
         }
 
-        private float3 ClosestPointOnTriangle(float3 p, float3 a, float3 b, float3 c)
+        private float GetQElement(BendingConstraint bend, int i, int j)
         {
-            float3 ab = b - a;
-            float3 ac = c - a;
-            float3 ap = p - a;
-
-            float d1 = math.dot(ab, ap);
-            float d2 = math.dot(ac, ap);
-            if (d1 <= 0f && d2 <= 0f) return a;
-
-            float3 bp = p - b;
-            float d3 = math.dot(ab, bp);
-            float d4 = math.dot(ac, bp);
-            if (d3 >= 0f && d4 <= d3) return b;
-
-            float3 cp = p - c;
-            float d5 = math.dot(ab, cp);
-            float d6 = math.dot(ac, cp);
-            if (d6 >= 0f && d5 <= d6) return c;
-
-            float vc = d1 * d4 - d3 * d2;
-            if (vc <= 0f && d1 >= 0f && d3 <= 0f)
+            if (i > j)
             {
-                float v = d1 / (d1 - d3);
-                return a + v * ab;
+                int tmp = i;
+                i = j;
+                j = tmp;
             }
 
-            float vb = d5 * d2 - d1 * d6;
-            if (vb <= 0f && d2 >= 0f && d6 <= 0f)
+            if (i == 0)
             {
-                float v = d2 / (d2 - d6);
-                return a + v * ac;
+                if (j == 0) return bend.Q00;
+                if (j == 1) return bend.Q01;
+                if (j == 2) return bend.Q02;
+                if (j == 3) return bend.Q03;
             }
-
-            float va = d3 * d6 - d5 * d4;
-            if (va <= 0f && (d4 - d3) >= 0f && (d5 - d6) >= 0f)
+            else if (i == 1)
             {
-                float v = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-                return b + v * (c - b);
+                if (j == 1) return bend.Q11;
+                if (j == 2) return bend.Q12;
+                if (j == 3) return bend.Q13;
             }
-
-            float denom = 1f / (va + vb + vc);
-            float v1 = vb * denom;
-            float v2 = vc * denom;
-            return a + ab * v1 + ac * v2;
+            else if (i == 2)
+            {
+                if (j == 2) return bend.Q22;
+                if (j == 3) return bend.Q23;
+            }
+            else if (i == 3)
+            {
+                return bend.Q33;
+            }
+            return 0f;
         }
     }
 
     [BurstCompile]
-    struct BuildSpatialHashJob : IJobParallelFor
+    public struct SelfCollisionJob : IJobParallelFor
     {
         [ReadOnly] public NativeArray<float3> positions;
-        [WriteOnly] public NativeMultiHashMap<int, int>.ParallelWriter spatialHash;
-        public float cellSize;
-
-        public void Execute(int i)
-        {
-            float3 p = positions[i];
-            int3 cell = (int3)math.floor(p / cellSize);
-            int hash = HashCell(cell.x, cell.y, cell.z);
-            spatialHash.Add(hash, i);
-        }
-
-        private int HashCell(int x, int y, int z)
-        {
-            return (x * 73856093) ^ (y * 19349663) ^ (z * 83492791);
-        }
-    }
-
-    [BurstCompile]
-    struct SelfCollisionJob : IJobParallelFor
-    {
-        [NativeDisableParallelForRestriction] public NativeArray<float3> positions;
-        [NativeDisableParallelForRestriction] public NativeArray<float3> velocities;
-        [ReadOnly] public NativeArray<float> inverseMasses;
-        [ReadOnly] public NativeMultiHashMap<int, int> spatialHash;
+        [ReadOnly] public NativeArray<float> invMasses;
         public float thickness;
-        public float friction;
-        public float cellSize;
+        public float hashCellSize;
+        [ReadOnly] public NativeParallelMultiHashMap<int3, int> spatialHash;
+        [WriteOnly] public NativeArray<float3> corrections;
 
         public void Execute(int i)
         {
-            if (inverseMasses[i] == 0f) return;
+            if (invMasses[i] == 0f)
+            {
+                corrections[i] = float3.zero;
+                return;
+            }
 
-            float3 pi = positions[i];
-            int3 cell = (int3)math.floor(pi / cellSize);
+            float3 pos = positions[i];
+            int3 cellCoord = (int3)math.floor(pos / hashCellSize);
+            float3 totalCorrection = float3.zero;
+            int collisionCount = 0;
 
-            // Check 27 neighboring cells
             for (int dx = -1; dx <= 1; dx++)
             {
                 for (int dy = -1; dy <= 1; dy++)
                 {
                     for (int dz = -1; dz <= 1; dz++)
                     {
-                        int3 neighborCell = cell + new int3(dx, dy, dz);
-                        int hash = HashCell(neighborCell.x, neighborCell.y, neighborCell.z);
-
-                        if (spatialHash.TryGetFirstValue(hash, out int j, out var iterator))
+                        int3 neighborCell = cellCoord + new int3(dx, dy, dz);
+                        if (spatialHash.TryGetFirstValue(neighborCell, out int j, out var it))
                         {
                             do
                             {
-                                if (j > i && inverseMasses[j] > 0f)
+                                if (j == i) continue;
+                                float3 diff = pos - positions[j];
+                                float dist = math.length(diff);
+                                if (dist < thickness && dist > 1e-7f)
                                 {
-                                    float3 pj = positions[j];
-                                    float3 delta = pi - pj;
-                                    float dist = math.length(delta);
-
-                                    if (dist < thickness && dist > 1e-9f)
+                                    float penetration = thickness - dist;
+                                    float3 dir = diff / dist;
+                                    float wA = invMasses[i];
+                                    float wB = invMasses[j];
+                                    float wSum = wA + wB;
+                                    if (wSum > 1e-9f)
                                     {
-                                        float3 dir = delta / dist;
-                                        float overlap = thickness - dist;
-
-                                        float invMassSum = inverseMasses[i] + inverseMasses[j];
-                                        float wi = inverseMasses[i] / invMassSum;
-                                        float wj = inverseMasses[j] / invMassSum;
-
-                                        positions[i] += dir * (overlap * wi);
-                                        positions[j] -= dir * (overlap * wj);
-
-                                        // Apply friction
-                                        float3 relVel = velocities[i] - velocities[j];
-                                        float3 velNormal = dir * math.dot(relVel, dir);
-                                        float3 velTangent = relVel - velNormal;
-                                        float3 frictionImpulse = velTangent * friction;
-
-                                        velocities[i] -= frictionImpulse * wi;
-                                        velocities[j] += frictionImpulse * wj;
+                                        totalCorrection += dir * (penetration * wA / wSum);
+                                        collisionCount++;
                                     }
                                 }
-                            } while (spatialHash.TryGetNextValue(out j, ref iterator));
+                            } while (spatialHash.TryGetNextValue(out j, ref it));
                         }
                     }
                 }
             }
-        }
 
-        private int HashCell(int x, int y, int z)
-        {
-            return (x * 73856093) ^ (y * 19349663) ^ (z * 83492791);
+            corrections[i] = totalCorrection;
         }
     }
 
     [BurstCompile]
-    struct UpdateVelocityPositionJob : IJobParallelFor
+    public struct ApplyCollisionCorrectionsJob : IJobParallelFor
     {
         public NativeArray<float3> positions;
-        public NativeArray<float3> velocities;
-        [ReadOnly] public NativeArray<float3> q;
-        public float dt;
+        [ReadOnly] public NativeArray<float3> corrections;
 
         public void Execute(int i)
         {
-            velocities[i] = (q[i] - positions[i]) / dt;
-            positions[i] = q[i];
+            positions[i] += corrections[i];
         }
     }
 
-    #endregion
+    [BurstCompile]
+    public struct SphereCollisionJob : IJobParallelFor
+    {
+        public NativeArray<float3> positions;
+        [ReadOnly] public NativeArray<float> invMasses;
+        [ReadOnly] public NativeArray<SphereColliderData> spheres;
+
+        public void Execute(int i)
+        {
+            if (invMasses[i] == 0f) return;
+
+            float3 pos = positions[i];
+            for (int s = 0; s < spheres.Length; s++)
+            {
+                var sphere = spheres[s];
+                float3 diff = pos - sphere.center;
+                float dist = math.length(diff);
+                if (dist < sphere.radius && dist > 1e-7f)
+                {
+                    float3 dir = diff / dist;
+                    positions[i] = sphere.center + dir * sphere.radius;
+                }
+            }
+        }
+    }
+
+    [BurstCompile]
+    public struct CapsuleCollisionJob : IJobParallelFor
+    {
+        public NativeArray<float3> positions;
+        [ReadOnly] public NativeArray<float> invMasses;
+        [ReadOnly] public NativeArray<CapsuleColliderData> capsules;
+
+        public void Execute(int i)
+        {
+            if (invMasses[i] == 0f) return;
+
+            float3 pos = positions[i];
+            for (int c = 0; c < capsules.Length; c++)
+            {
+                var capsule = capsules[c];
+                float3 axis = capsule.point1 - capsule.point0;
+                float axisLen = math.length(axis);
+                if (axisLen < 1e-7f) continue;
+
+                float3 axisDir = axis / axisLen;
+                float3 diff = pos - capsule.point0;
+                float t = math.clamp(math.dot(diff, axisDir), 0f, axisLen);
+                float3 closest = capsule.point0 + axisDir * t;
+                float3 toPos = pos - closest;
+                float dist = math.length(toPos);
+
+                if (dist < capsule.radius && dist > 1e-7f)
+                {
+                    float3 dir = toPos / dist;
+                    positions[i] = closest + dir * capsule.radius;
+                }
+            }
+        }
+    }
+
+    [BurstCompile]
+    public struct VelocityUpdateJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<float3> newPositions;
+        [ReadOnly] public NativeArray<float3> oldPositions;
+        public float damping;
+        public float dt;
+        public NativeArray<float3> velocities;
+
+        public void Execute(int i)
+        {
+            velocities[i] = ((newPositions[i] - oldPositions[i]) / dt) * damping;
+        }
+    }
+
+    // ============================================================================
+    // CLOTH OFFLINE BAKER MONOBEHAVIOUR
+    // ============================================================================
+
+    [ExecuteInEditMode]
+    public class ClothOfflineBaker : MonoBehaviour
+    {
+        [Header("Simulation Parameters")]
+        public float timeStep = 0.008f;
+        public int solverIterations = 50;
+        public int totalFrames = 300;
+        public float distanceWeight = 1000f;
+        public float bendingStiffness = 0.1f;
+        public float particleMassValue = 0.1f;
+        public float damping = 0.995f;
+        public Vector3 gravity = new Vector3(0, -9.81f, 0);
+
+        [Header("Collision")]
+        public float thickness = 0.005f;
+        public bool enableSelfCollision = true;
+        public float hashCellSize = 0.02f;
+        public int collisionSubstepInterval = 5;
+
+        [Header("Colliders")]
+        public List<Transform> sphereColliders = new List<Transform>();
+        public List<Transform> capsuleColliders = new List<Transform>();
+
+        [Header("Pinning")]
+        public List<int> pinnedParticleIndices = new List<int>();
+
+        // Internal state
+        private Mesh workingMesh;
+        private int particleCount;
+        private NativeArray<float3> positions;
+        private NativeArray<float3> velocities;
+        private NativeArray<float3> momentum;
+        private NativeArray<float> masses;
+        private NativeArray<float> invMasses;
+
+        private NativeArray<DistanceConstraint> distanceConstraints;
+        private NativeArray<BendingConstraint> bendingConstraints;
+        private NativeArray<float3> distanceProjections;
+
+        private NativeArray<int> distanceOffsets;
+        private NativeArray<ParticleConstraintRef> distanceRefs;
+        private NativeArray<int> bendOffsets;
+        private NativeArray<ParticleBendRef> bendRefs;
+
+        private NativeArray<float3> collisionCorrections;
+        private NativeParallelMultiHashMap<int3, int> spatialHash;
+
+        private NativeArray<SphereColliderData> sphereData;
+        private NativeArray<CapsuleColliderData> capsuleData;
+
+        private Vector3[] originalVertices;
+        private int[] originalTriangles;
+        private Vector3[] originalNormals;
+        private Vector4[] originalTangents;
+
+        private bool isInitialised = false;
+        private int currentFrame = 0;
+
+        // ========================================================================
+        // INITIALISATION
+        // ========================================================================
+
+        [ContextMenu("Initialise")]
+        public void Initialise()
+        {
+            Cleanup();
+
+            MeshFilter mf = GetComponent<MeshFilter>();
+            if (mf == null || mf.sharedMesh == null)
+            {
+                Debug.LogError("No MeshFilter or mesh found!");
+                return;
+            }
+
+            Mesh sourceMesh = mf.sharedMesh;
+            workingMesh = Instantiate(sourceMesh);
+
+            originalVertices = sourceMesh.vertices;
+            originalTriangles = sourceMesh.triangles;
+            originalNormals = sourceMesh.normals;
+            originalTangents = sourceMesh.tangents;
+
+            particleCount = originalVertices.Length;
+
+            // Transform to world space
+            Vector3[] worldVerts = new Vector3[particleCount];
+            for (int i = 0; i < particleCount; i++)
+            {
+                worldVerts[i] = transform.TransformPoint(originalVertices[i]);
+            }
+
+            // Allocate arrays
+            positions = new NativeArray<float3>(particleCount, Allocator.Persistent);
+            velocities = new NativeArray<float3>(particleCount, Allocator.Persistent);
+            momentum = new NativeArray<float3>(particleCount, Allocator.Persistent);
+            masses = new NativeArray<float>(particleCount, Allocator.Persistent);
+            invMasses = new NativeArray<float>(particleCount, Allocator.Persistent);
+
+            for (int i = 0; i < particleCount; i++)
+            {
+                positions[i] = worldVerts[i];
+                velocities[i] = float3.zero;
+                masses[i] = particleMassValue;
+                invMasses[i] = pinnedParticleIndices.Contains(i) ? 0f : 1f / particleMassValue;
+            }
+
+            // Build distance constraints from edges
+            BuildDistanceConstraints(originalTriangles);
+
+            // Build bending constraints
+            BuildBendingConstraints(originalTriangles, worldVerts);
+
+            // Build CSR structures
+            BuildCSR();
+
+            // Allocate collision arrays
+            collisionCorrections = new NativeArray<float3>(particleCount, Allocator.Persistent);
+            spatialHash = new NativeParallelMultiHashMap<int3, int>(particleCount * 27, Allocator.Persistent);
+
+            // Allocate collider arrays
+            sphereData = new NativeArray<SphereColliderData>(sphereColliders.Count, Allocator.Persistent);
+            capsuleData = new NativeArray<CapsuleColliderData>(capsuleColliders.Count, Allocator.Persistent);
+
+            isInitialised = true;
+            currentFrame = 0;
+
+            Debug.Log($"Initialised cloth simulation: {particleCount} particles, " +
+                     $"{distanceConstraints.Length} distance constraints, " +
+                     $"{bendingConstraints.Length} bending constraints");
+        }
+
+        private void BuildDistanceConstraints(int[] triangles)
+        {
+            var edgeSet = new HashSet<(int, int)>();
+            var edgeList = new List<DistanceConstraint>();
+
+            for (int i = 0; i < triangles.Length; i += 3)
+            {
+                int a = triangles[i];
+                int b = triangles[i + 1];
+                int c = triangles[i + 2];
+
+                AddEdge(edgeSet, edgeList, a, b);
+                AddEdge(edgeSet, edgeList, b, c);
+                AddEdge(edgeSet, edgeList, c, a);
+            }
+
+            distanceConstraints = new NativeArray<DistanceConstraint>(edgeList.Count, Allocator.Persistent);
+            for (int i = 0; i < edgeList.Count; i++)
+            {
+                distanceConstraints[i] = edgeList[i];
+            }
+
+            distanceProjections = new NativeArray<float3>(edgeList.Count * 2, Allocator.Persistent);
+        }
+
+        private void AddEdge(HashSet<(int, int)> edgeSet, List<DistanceConstraint> edgeList, int a, int b)
+        {
+            if (a > b)
+            {
+                int tmp = a;
+                a = b;
+                b = tmp;
+            }
+
+            if (!edgeSet.Contains((a, b)))
+            {
+                edgeSet.Add((a, b));
+                float3 pA = positions[a];
+                float3 pB = positions[b];
+                float restLen = math.length(pB - pA);
+                edgeList.Add(new DistanceConstraint
+                {
+                    particleA = a,
+                    particleB = b,
+                    restLength = restLen,
+                    weight = distanceWeight
+                });
+            }
+        }
+
+        private void BuildBendingConstraints(int[] triangles, Vector3[] worldVerts)
+        {
+            // Build edge-to-triangle adjacency
+            var edgeToTris = new Dictionary<(int, int), List<int>>();
+
+            for (int triIdx = 0; triIdx < triangles.Length / 3; triIdx++)
+            {
+                int i0 = triangles[triIdx * 3];
+                int i1 = triangles[triIdx * 3 + 1];
+                int i2 = triangles[triIdx * 3 + 2];
+
+                AddTriToEdge(edgeToTris, i0, i1, triIdx);
+                AddTriToEdge(edgeToTris, i1, i2, triIdx);
+                AddTriToEdge(edgeToTris, i2, i0, triIdx);
+            }
+
+            // Find interior edges (shared by 2 triangles)
+            var bendList = new List<BendingConstraint>();
+            foreach (var kvp in edgeToTris)
+            {
+                if (kvp.Value.Count == 2)
+                {
+                    var edge = kvp.Key;
+                    int p0 = edge.Item1;
+                    int p1 = edge.Item2;
+                    int tri0 = kvp.Value[0];
+                    int tri1 = kvp.Value[1];
+
+                    int p2 = GetOppositeVertex(triangles, tri0, p0, p1);
+                    int p3 = GetOppositeVertex(triangles, tri1, p0, p1);
+
+                    if (p2 == -1 || p3 == -1) continue;
+
+                    var Q = ComputeIsometricBendingMatrix(worldVerts, p0, p1, p2, p3);
+                    if (Q.HasValue)
+                    {
+                        bendList.Add(Q.Value);
+                    }
+                }
+            }
+
+            bendingConstraints = new NativeArray<BendingConstraint>(bendList.Count, Allocator.Persistent);
+            for (int i = 0; i < bendList.Count; i++)
+            {
+                bendingConstraints[i] = bendList[i];
+            }
+        }
+
+        private void AddTriToEdge(Dictionary<(int, int), List<int>> edgeToTris, int a, int b, int triIdx)
+        {
+            if (a > b)
+            {
+                int tmp = a;
+                a = b;
+                b = tmp;
+            }
+
+            if (!edgeToTris.ContainsKey((a, b)))
+            {
+                edgeToTris[(a, b)] = new List<int>();
+            }
+            edgeToTris[(a, b)].Add(triIdx);
+        }
+
+        private int GetOppositeVertex(int[] triangles, int triIdx, int e0, int e1)
+        {
+            int i0 = triangles[triIdx * 3];
+            int i1 = triangles[triIdx * 3 + 1];
+            int i2 = triangles[triIdx * 3 + 2];
+
+            if (i0 != e0 && i0 != e1) return i0;
+            if (i1 != e0 && i1 != e1) return i1;
+            if (i2 != e0 && i2 != e1) return i2;
+            return -1;
+        }
+
+        private BendingConstraint? ComputeIsometricBendingMatrix(Vector3[] verts, int p0, int p1, int p2, int p3)
+        {
+            float3 x0 = verts[p0];
+            float3 x1 = verts[p1];
+            float3 x2 = verts[p2];
+            float3 x3 = verts[p3];
+
+            float3 e = x1 - x0;
+            float3 n1 = math.cross(e, x2 - x0);
+            float3 n2 = math.cross(x3 - x0, e);
+
+            float A1 = math.length(n1) * 0.5f;
+            float A2 = math.length(n2) * 0.5f;
+
+            if (A1 < 1e-9f || A2 < 1e-9f) return null;
+
+            // Cotangent weights
+            float cot01 = Cot(x2 - x0, x2 - x1);
+            float cot02 = Cot(x3 - x0, x3 - x1);
+
+            float A = A1 + A2;
+            float scale = 3.0f / A;
+
+            // K = [cot01 + cot02, -cot01 - cot02, -cot01, -cot02]
+            float4 K = new float4(cot01 + cot02, -cot01 - cot02, -cot01, -cot02);
+
+            // Q = scale * K * K^T
+            float Q00 = scale * K.x * K.x;
+            float Q01 = scale * K.x * K.y;
+            float Q02 = scale * K.x * K.z;
+            float Q03 = scale * K.x * K.w;
+            float Q11 = scale * K.y * K.y;
+            float Q12 = scale * K.y * K.z;
+            float Q13 = scale * K.y * K.w;
+            float Q22 = scale * K.z * K.z;
+            float Q23 = scale * K.z * K.w;
+            float Q33 = scale * K.w * K.w;
+
+            return new BendingConstraint
+            {
+                p0 = p0,
+                p1 = p1,
+                p2 = p2,
+                p3 = p3,
+                Q00 = Q00,
+                Q01 = Q01,
+                Q02 = Q02,
+                Q03 = Q03,
+                Q11 = Q11,
+                Q12 = Q12,
+                Q13 = Q13,
+                Q22 = Q22,
+                Q23 = Q23,
+                Q33 = Q33,
+                weight = bendingStiffness
+            };
+        }
+
+        private float Cot(float3 a, float3 b)
+        {
+            float cosTheta = math.dot(a, b);
+            float sinTheta = math.length(math.cross(a, b));
+            if (math.abs(sinTheta) < 1e-9f) return 0f;
+            return cosTheta / sinTheta;
+        }
+
+        private void BuildCSR()
+        {
+            // Build distance constraint CSR
+            var distPerParticle = new List<ParticleConstraintRef>[particleCount];
+            for (int i = 0; i < particleCount; i++)
+            {
+                distPerParticle[i] = new List<ParticleConstraintRef>();
+            }
+
+            for (int i = 0; i < distanceConstraints.Length; i++)
+            {
+                var c = distanceConstraints[i];
+                distPerParticle[c.particleA].Add(new ParticleConstraintRef { constraintIndex = i, localIndex = 0 });
+                distPerParticle[c.particleB].Add(new ParticleConstraintRef { constraintIndex = i, localIndex = 1 });
+            }
+
+            int totalDistRefs = distPerParticle.Sum(list => list.Count);
+            distanceOffsets = new NativeArray<int>(particleCount + 1, Allocator.Persistent);
+            distanceRefs = new NativeArray<ParticleConstraintRef>(totalDistRefs, Allocator.Persistent);
+
+            int offset = 0;
+            for (int i = 0; i < particleCount; i++)
+            {
+                distanceOffsets[i] = offset;
+                foreach (var cref in distPerParticle[i])
+                {
+                    distanceRefs[offset++] = cref;
+                }
+            }
+            distanceOffsets[particleCount] = offset;
+
+            // Build bending constraint CSR
+            var bendPerParticle = new List<ParticleBendRef>[particleCount];
+            for (int i = 0; i < particleCount; i++)
+            {
+                bendPerParticle[i] = new List<ParticleBendRef>();
+            }
+
+            for (int i = 0; i < bendingConstraints.Length; i++)
+            {
+                var b = bendingConstraints[i];
+                bendPerParticle[b.p0].Add(new ParticleBendRef { bendIndex = i, localIndex = 0 });
+                bendPerParticle[b.p1].Add(new ParticleBendRef { bendIndex = i, localIndex = 1 });
+                bendPerParticle[b.p2].Add(new ParticleBendRef { bendIndex = i, localIndex = 2 });
+                bendPerParticle[b.p3].Add(new ParticleBendRef { bendIndex = i, localIndex = 3 });
+            }
+
+            int totalBendRefs = bendPerParticle.Sum(list => list.Count);
+            bendOffsets = new NativeArray<int>(particleCount + 1, Allocator.Persistent);
+            bendRefs = new NativeArray<ParticleBendRef>(totalBendRefs, Allocator.Persistent);
+
+            offset = 0;
+            for (int i = 0; i < particleCount; i++)
+            {
+                bendOffsets[i] = offset;
+                foreach (var bref in bendPerParticle[i])
+                {
+                    bendRefs[offset++] = bref;
+                }
+            }
+            bendOffsets[particleCount] = offset;
+        }
+
+        // ========================================================================
+        // SIMULATION STEP
+        // ========================================================================
+
+        [ContextMenu("Bake Single Frame")]
+        public void BakeSingleFrame()
+        {
+            if (!isInitialised)
+            {
+                Debug.LogWarning("Not initialised. Call Initialise first.");
+                return;
+            }
+
+            SimulateStep();
+            WriteMesh();
+            currentFrame++;
+
+            Debug.Log($"Baked frame {currentFrame}");
+        }
+
+        [ContextMenu("Bake All Frames")]
+        public void BakeAllFrames()
+        {
+            if (!isInitialised)
+            {
+                Debug.LogWarning("Not initialised. Call Initialise first.");
+                return;
+            }
+
+            for (int i = 0; i < totalFrames; i++)
+            {
+                SimulateStep();
+                WriteMesh();
+                currentFrame++;
+
+                if (i % 10 == 0)
+                {
+                    Debug.Log($"Baked frame {currentFrame}/{totalFrames}");
+                }
+            }
+
+            Debug.Log($"Baking complete: {totalFrames} frames");
+        }
+
+        private void SimulateStep()
+        {
+            // 1. Momentum step
+            var momentumJob = new MomentumStepJob
+            {
+                positions = positions,
+                velocities = velocities,
+                invMasses = invMasses,
+                dt = timeStep,
+                gravity = gravity,
+                momentum = momentum
+            };
+            momentumJob.Schedule(particleCount, 64).Complete();
+
+            // Save old positions for velocity update
+            NativeArray<float3> oldPositions = new NativeArray<float3>(particleCount, Allocator.TempJob);
+            var copyJob = new CopyFloat3Job { source = positions, dest = oldPositions };
+            copyJob.Schedule(particleCount, 64).Complete();
+
+            // 2. Local-global iterations with interleaved collision
+            for (int iter = 0; iter < solverIterations; iter++)
+            {
+                // Local step: distance constraints
+                var localJob = new LocalStepDistanceJob
+                {
+                    positions = positions,
+                    invMasses = invMasses,
+                    constraints = distanceConstraints,
+                    projections = distanceProjections
+                };
+                localJob.Schedule(distanceConstraints.Length, 64).Complete();
+
+                // Global step: gather and solve
+                var globalJob = new GlobalStepGatherAndSolveJob
+                {
+                    momentum = momentum,
+                    invMasses = invMasses,
+                    masses = masses,
+                    dt = timeStep,
+                    distanceProjections = distanceProjections,
+                    distanceConstraints = distanceConstraints,
+                    distanceOffsets = distanceOffsets,
+                    distanceRefs = distanceRefs,
+                    bendConstraints = bendingConstraints,
+                    bendOffsets = bendOffsets,
+                    bendRefs = bendRefs,
+                    currentPositions = positions,
+                    newPositions = positions
+                };
+                globalJob.Schedule(particleCount, 64).Complete();
+
+                // Interleaved collision
+                if (enableSelfCollision && (iter + 1) % collisionSubstepInterval == 0)
+                {
+                    ResolveSelfCollision();
+                }
+
+                ResolveSphereCollisions();
+                ResolveCapsuleCollisions();
+            }
+
+            // Final collision pass
+            if (enableSelfCollision)
+            {
+                ResolveSelfCollision();
+            }
+            ResolveSphereCollisions();
+            ResolveCapsuleCollisions();
+
+            // 3. Velocity update
+            var velocityJob = new VelocityUpdateJob
+            {
+                newPositions = positions,
+                oldPositions = oldPositions,
+                damping = damping,
+                dt = timeStep,
+                velocities = velocities
+            };
+            velocityJob.Schedule(particleCount, 64).Complete();
+
+            oldPositions.Dispose();
+        }
+
+        private void ResolveSelfCollision()
+        {
+            // Build spatial hash
+            spatialHash.Clear();
+            for (int i = 0; i < particleCount; i++)
+            {
+                int3 cellCoord = (int3)math.floor(positions[i] / hashCellSize);
+                spatialHash.Add(cellCoord, i);
+            }
+
+            // Compute corrections
+            var collisionJob = new SelfCollisionJob
+            {
+                positions = positions,
+                invMasses = invMasses,
+                thickness = thickness,
+                hashCellSize = hashCellSize,
+                spatialHash = spatialHash,
+                corrections = collisionCorrections
+            };
+            collisionJob.Schedule(particleCount, 64).Complete();
+
+            // Apply corrections
+            var applyJob = new ApplyCollisionCorrectionsJob
+            {
+                positions = positions,
+                corrections = collisionCorrections
+            };
+            applyJob.Schedule(particleCount, 64).Complete();
+        }
+
+        private void ResolveSphereCollisions()
+        {
+            if (sphereColliders.Count == 0) return;
+
+            // Update sphere data
+            int validCount = 0;
+            for (int i = 0; i < sphereColliders.Count; i++)
+            {
+                var t = sphereColliders[i];
+                if (t == null) continue;
+
+                SphereCollider sc = t.GetComponent<SphereCollider>();
+                if (sc != null)
+                {
+                    float3 center = t.TransformPoint(sc.center);
+                    float radius = sc.radius * math.cmax(t.lossyScale);
+                    sphereData[validCount++] = new SphereColliderData { center = center, radius = radius };
+                }
+                else
+                {
+                    // Fallback: use transform position with default radius
+                    float3 center = t.position;
+                    float radius = 0.1f * math.cmax(t.lossyScale);
+                    sphereData[validCount++] = new SphereColliderData { center = center, radius = radius };
+                }
+            }
+
+            if (validCount == 0) return;
+
+            var sphereJob = new SphereCollisionJob
+            {
+                positions = positions,
+                invMasses = invMasses,
+                spheres = sphereData.GetSubArray(0, validCount)
+            };
+            sphereJob.Schedule(particleCount, 64).Complete();
+        }
+
+        private void ResolveCapsuleCollisions()
+        {
+            if (capsuleColliders.Count == 0) return;
+
+            // Update capsule data
+            int validCount = 0;
+            for (int i = 0; i < capsuleColliders.Count; i++)
+            {
+                var t = capsuleColliders[i];
+                if (t == null) continue;
+
+                CapsuleCollider cc = t.GetComponent<CapsuleCollider>();
+                if (cc != null)
+                {
+                    float3 center = t.TransformPoint(cc.center);
+                    float height = cc.height * math.cmax(t.lossyScale);
+                    float radius = cc.radius * math.cmax(t.lossyScale);
+
+                    // Compute capsule axis
+                    float3 axis = float3.zero;
+                    if (cc.direction == 0) axis = new float3(1, 0, 0);
+                    else if (cc.direction == 1) axis = new float3(0, 1, 0);
+                    else axis = new float3(0, 0, 1);
+
+                    axis = math.rotate(t.rotation, axis);
+                    float halfHeight = math.max(0, (height - 2 * radius) * 0.5f);
+
+                    float3 p0 = center - axis * halfHeight;
+                    float3 p1 = center + axis * halfHeight;
+
+                    capsuleData[validCount++] = new CapsuleColliderData
+                    {
+                        point0 = p0,
+                        point1 = p1,
+                        radius = radius
+                    };
+                }
+            }
+
+            if (validCount == 0) return;
+
+            var capsuleJob = new CapsuleCollisionJob
+            {
+                positions = positions,
+                invMasses = invMasses,
+                capsules = capsuleData.GetSubArray(0, validCount)
+            };
+            capsuleJob.Schedule(particleCount, 64).Complete();
+        }
+
+        private void WriteMesh()
+        {
+            Vector3[] newVertices = new Vector3[particleCount];
+            for (int i = 0; i < particleCount; i++)
+            {
+                float3 worldPos = positions[i];
+                newVertices[i] = transform.InverseTransformPoint(worldPos);
+            }
+
+            workingMesh.vertices = newVertices;
+            workingMesh.RecalculateNormals();
+            workingMesh.RecalculateBounds();
+            workingMesh.RecalculateTangents();
+
+            MeshFilter mf = GetComponent<MeshFilter>();
+            if (mf != null)
+            {
+                mf.mesh = workingMesh;
+            }
+        }
+
+        // ========================================================================
+        // UTILITY METHODS
+        // ========================================================================
+
+        [ContextMenu("Reset Simulation")]
+        public void ResetSimulation()
+        {
+            if (!isInitialised)
+            {
+                Debug.LogWarning("Not initialised.");
+                return;
+            }
+
+            for (int i = 0; i < particleCount; i++)
+            {
+                positions[i] = transform.TransformPoint(originalVertices[i]);
+                velocities[i] = float3.zero;
+            }
+
+            currentFrame = 0;
+            WriteMesh();
+
+            Debug.Log("Simulation reset");
+        }
+
+        [ContextMenu("Save Baked Mesh")]
+        public void SaveBakedMesh()
+        {
+            if (workingMesh == null)
+            {
+                Debug.LogWarning("No mesh to save.");
+                return;
+            }
+
+            string path = EditorUtility.SaveFilePanelInProject(
+                "Save Baked Mesh",
+                "BakedClothMesh",
+                "asset",
+                "Save the baked cloth mesh as an asset");
+
+            if (string.IsNullOrEmpty(path)) return;
+
+            Mesh savedMesh = Instantiate(workingMesh);
+            AssetDatabase.CreateAsset(savedMesh, path);
+            AssetDatabase.SaveAssets();
+
+            Debug.Log($"Saved mesh to {path}");
+        }
+
+        public void Cleanup()
+        {
+            if (positions.IsCreated) positions.Dispose();
+            if (velocities.IsCreated) velocities.Dispose();
+            if (momentum.IsCreated) momentum.Dispose();
+            if (masses.IsCreated) masses.Dispose();
+            if (invMasses.IsCreated) invMasses.Dispose();
+            if (distanceConstraints.IsCreated) distanceConstraints.Dispose();
+            if (bendingConstraints.IsCreated) bendingConstraints.Dispose();
+            if (distanceProjections.IsCreated) distanceProjections.Dispose();
+            if (distanceOffsets.IsCreated) distanceOffsets.Dispose();
+            if (distanceRefs.IsCreated) distanceRefs.Dispose();
+            if (bendOffsets.IsCreated) bendOffsets.Dispose();
+            if (bendRefs.IsCreated) bendRefs.Dispose();
+            if (collisionCorrections.IsCreated) collisionCorrections.Dispose();
+            if (spatialHash.IsCreated) spatialHash.Dispose();
+            if (sphereData.IsCreated) sphereData.Dispose();
+            if (capsuleData.IsCreated) capsuleData.Dispose();
+
+            isInitialised = false;
+        }
+
+        private void OnDisable()
+        {
+            Cleanup();
+        }
+
+        private void OnDestroy()
+        {
+            Cleanup();
+        }
+    }
+
+    // ============================================================================
+    // CUSTOM EDITOR
+    // ============================================================================
+
+    [CustomEditor(typeof(ClothOfflineBaker))]
+    public class ClothOfflineBakerEditor : Editor
+    {
+        public override void OnInspectorGUI()
+        {
+            DrawDefaultInspector();
+
+            EditorGUILayout.Space();
+            EditorGUILayout.HelpBox(
+                "Cloth Offline Baker using Projective Dynamics with isometric bending.\n\n" +
+                "1. Initialise - Setup simulation from mesh\n" +
+                "2. Bake Single Frame - Simulate one frame\n" +
+                "3. Bake All Frames - Simulate all frames\n" +
+                "4. Reset - Return to initial state\n" +
+                "5. Save Mesh Asset - Save current mesh as asset",
+                MessageType.Info);
+
+            EditorGUILayout.Space();
+
+            ClothOfflineBaker baker = (ClothOfflineBaker)target;
+
+            GUI.backgroundColor = Color.green;
+            if (GUILayout.Button("Initialise", GUILayout.Height(40)))
+            {
+                baker.Initialise();
+                SceneView.RepaintAll();
+            }
+
+            GUI.backgroundColor = Color.cyan;
+            if (GUILayout.Button("Bake Single Frame", GUILayout.Height(40)))
+            {
+                baker.BakeSingleFrame();
+                SceneView.RepaintAll();
+            }
+
+            GUI.backgroundColor = Color.blue;
+            if (GUILayout.Button("Bake All Frames", GUILayout.Height(40)))
+            {
+                baker.BakeAllFrames();
+                SceneView.RepaintAll();
+            }
+
+            GUI.backgroundColor = Color.yellow;
+            if (GUILayout.Button("Reset Simulation", GUILayout.Height(40)))
+            {
+                baker.ResetSimulation();
+                SceneView.RepaintAll();
+            }
+
+            GUI.backgroundColor = Color.magenta;
+            if (GUILayout.Button("Save Mesh Asset", GUILayout.Height(40)))
+            {
+                baker.SaveBakedMesh();
+            }
+
+            GUI.backgroundColor = Color.white;
+        }
+    }
 }
+
 #endif
